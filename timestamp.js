@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ÖBA Video Kontrolcüsü & Otomatik Tamamlayıcı
 // @namespace    http://tampermonkey.net/
-// @version      0.7
-// @description  ÖBA (oba.gov.tr) ve EBA için video içi kontrolcüsü, arka planda çalışma (blur engeli kaldırma), son saniyelere sarma ve otomatik tuş tetikleyici (Ctrl + Alt + .)
+// @version      0.8
+// @description  ÖBA (oba.gov.tr) ve EBA için anti-atlama engelini kaldıran, videoyu anında son saniyelere saran, hızlandıran ve bitince Ctrl+Alt+. tetikleyen tam kontrolcü
 // @match        *://*.oba.gov.tr/*
 // @match        *://oba.gov.tr/*
 // @match        *://*.eba.gov.tr/*
@@ -24,8 +24,23 @@
     'use strict';
 
     // ==========================================
-    // 1. BLUR & ARKAPLAN KORUMASI
+    // 1. SİTE ENGELLEMELERİNİ NÖTRALİZE ETME
     // ==========================================
+
+    // Sitenin 'seeking' (sarma) ve 'ratechange' (hız) olaylarını dinleyip süreyi geri almasını engelle
+    const originalAddEventListener = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function(type, listener, options) {
+        // Eğer bir video veya oynatıcı 'seeking' engelleyicisi eklemeye çalışıyorsa engelle
+        if (type === 'seeking' || type === 'ratechange') {
+            if (this instanceof HTMLMediaElement || (this && this.tagName === 'VIDEO')) {
+                // Sitenin araya girip süreyi geri almasını önle
+                return;
+            }
+        }
+        return originalAddEventListener.apply(this, arguments);
+    };
+
+    // Arka plan (Blur) Koruması
     try {
         window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
         window.addEventListener('focusout', (e) => e.stopImmediatePropagation(), true);
@@ -36,42 +51,40 @@
         Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
         Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
         Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
-    } catch (e) {
-        console.warn('Blur koruması eklenirken hata:', e);
-    }
+    } catch (e) {}
 
     // ==========================================
-    // 2. VİDEO YÖNETİMİ & ZAMAN SARMA
+    // 2. VİDEO YÖNETİMİ & GERÇEK ZAMAN SARMA
     // ==========================================
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // Video Elementini Bulucu
     function getVideo() {
         return document.querySelector('video');
     }
 
-    // Video.js veya HTML5 Video Üzerinden Zorla Zamanı Ayarlama
+    // VideoJS / Oynatıcı nesnelerinin engellerini kaldır ve zamanı ayarla
     function applyTime(video, targetTime) {
         if (!video) return;
 
-        // 1. Video.js Oynatıcısını Kontrol Et ve Ayarla
+        // 1. Video.js Oynatıcılarını Çöz
         try {
             if (window.videojs) {
                 const players = window.videojs.getAllPlayers ? window.videojs.getAllPlayers() : Object.values(window.videojs.players || {});
                 players.forEach(player => {
-                    if (player && typeof player.currentTime === 'function') {
-                        player.currentTime(targetTime);
+                    if (player) {
+                        try { if (player.off) player.off('seeking'); } catch(e) {}
+                        if (typeof player.currentTime === 'function') {
+                            player.currentTime(targetTime);
+                        }
                         if (player.paused && typeof player.play === 'function') {
                             player.play();
                         }
                     }
                 });
             }
-        } catch (e) {
-            console.log('VideoJS ayarlama denemesi:', e);
-        }
+        } catch (e) {}
 
-        // 2. HTML5 Video Elementi Prototype ve Standart Setter
+        // 2. HTMLMediaElement Prototype Setter
         try {
             const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
             if (descriptor && descriptor.set) {
@@ -83,20 +96,33 @@
             video.currentTime = targetTime;
         }
 
-        // 3. Eventleri Tetikle
+        // 3. Eventleri tetikle
         try {
-            video.dispatchEvent(new Event('seeking', { bubbles: true }));
             video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
             video.dispatchEvent(new Event('seeked', { bubbles: true }));
         } catch (e) {}
 
-        // 4. Oynatmaya zorla
         if (video.paused) {
             video.play().catch(() => {});
         }
     }
 
-    // "Ctrl + Alt + ." Tuş Kombinasyonu Tetikleyici (Hem frame hem parent/top'a gönderir)
+    // Hızı Zorla Ayarla
+    function applySpeed(video, rate) {
+        if (!video) return;
+        video.playbackRate = rate;
+
+        try {
+            if (window.videojs) {
+                const players = window.videojs.getAllPlayers ? window.videojs.getAllPlayers() : Object.values(window.videojs.players || {});
+                players.forEach(p => {
+                    if (p && typeof p.playbackRate === 'function') p.playbackRate(rate);
+                });
+            }
+        } catch (e) {}
+    }
+
+    // "Ctrl + Alt + ." Tuş Kombinasyonunu Tetikle
     async function triggerCtrlAltDot() {
         await sleep(500);
 
@@ -114,8 +140,6 @@
         };
 
         const targets = [document.activeElement, document.body, document, window];
-        
-        // Üst pencereler varsa onları da dahil et
         try { if (window.parent && window.parent !== window) targets.push(window.parent.document, window.parent); } catch(e){}
         try { if (window.top && window.top !== window) targets.push(window.top.document, window.top); } catch(e){}
 
@@ -313,59 +337,48 @@
 
             const duration = video.duration;
             if (!duration || isNaN(duration) || duration <= 0) {
-                showStatus('⚠️ Video süresi yüklenmedi, önce videoyu başlatın!', 3000, '#ff7675');
+                showStatus('⚠️ Video süresi henüz yüklenmedi, önce videoyu başlatın!', 3000, '#ff7675');
                 return;
             }
 
             const offset = parseInt(endOffsetSlider.value, 10) || 2;
             const targetTime = Math.max(0, duration - offset);
 
-            // Zamanı zorla ayarla
-            applyTime(video, targetTime);
+            showStatus(`⏳ Son ${offset} sn'ye sarılıyor...`, 0, '#ffeaa7');
 
-            // Birkaç kez tekrarla (Sitenin sıfırlamasını engellemek için)
-            let retryCount = 0;
-            const retryInterval = setInterval(() => {
-                if (retryCount++ < 5 && video.currentTime < targetTime - 1) {
-                    applyTime(video, targetTime);
-                } else {
-                    clearInterval(retryInterval);
+            // 1. Adım: Sürekli ve zorlayıcı sarma uygula
+            let seekAttempts = 0;
+            const seekLoop = setInterval(() => {
+                applyTime(video, targetTime);
+                seekAttempts++;
+                // Video hedef süreye ulaştıysa veya 10 deneme bittiyse durdur
+                if (Math.abs(video.currentTime - targetTime) <= 2 || seekAttempts >= 10) {
+                    clearInterval(seekLoop);
                 }
             }, 100);
 
-            showStatus(`⏳ Son ${offset} sn'ye sarıldı, bitiş bekleniyor...`, 0, '#ffeaa7');
-
-            let handled = false;
-            const completeAction = async () => {
-                if (handled) return;
-                handled = true;
-
-                video.removeEventListener('ended', completeAction);
-                video.removeEventListener('pause', onPauseCheck);
-                video.removeEventListener('timeupdate', onTimeUpdateCheck);
-
-                showStatus('⏳ Video tamamlandı, bekleniyor...', 0, '#74b9ff');
-                await sleep(800);
-
-                await triggerCtrlAltDot();
-                showStatus('✅ "Ctrl + Alt + ." tuşlandı!', 4000, '#55efc4');
-            };
-
-            const onPauseCheck = () => {
-                if (video.currentTime >= video.duration - 0.6 || video.ended) {
-                    completeAction();
+            // 2. Adım: Eğer video akışı HLS sebebiyle sarılamadıysa Turbo 16x modunu devreye sok
+            setTimeout(() => {
+                if (video.currentTime < targetTime - 5) {
+                    showStatus('⚡ Turbo Hız Modu (16x) Aktif...', 0, '#00d2d3');
+                    applySpeed(video, 16);
                 }
-            };
+            }, 1200);
 
-            const onTimeUpdateCheck = () => {
-                if (video.currentTime >= video.duration - 0.3 || video.ended) {
-                    completeAction();
+            // 3. Adım: Gerçekten bitişe ulaşıldığını periyodik olarak kontrol et
+            let checkFinishedInterval = setInterval(async () => {
+                const isNearEnd = (video.currentTime >= video.duration - Math.min(offset, 1.5)) || video.ended;
+                
+                if (isNearEnd && video.duration > 5) {
+                    clearInterval(checkFinishedInterval);
+
+                    showStatus('⏳ Video tamamlandı, bekleniyor...', 0, '#74b9ff');
+                    await sleep(800);
+
+                    await triggerCtrlAltDot();
+                    showStatus('✅ "Ctrl + Alt + ." başarıyla basıldı!', 4000, '#55efc4');
                 }
-            };
-
-            video.addEventListener('ended', completeAction, { once: true });
-            video.addEventListener('pause', onPauseCheck);
-            video.addEventListener('timeupdate', onTimeUpdateCheck);
+            }, 300);
         });
     }
 
@@ -388,10 +401,12 @@
                 applyTime(video, Math.max(0, video.currentTime - skipSecs));
                 break;
             case settings.speedUpKey:
-                video.playbackRate = Math.min(16, video.playbackRate + 0.25);
+                const newUpRate = Math.min(16, (video.playbackRate || 1) + 0.5);
+                applySpeed(video, newUpRate);
                 break;
             case settings.speedDownKey:
-                video.playbackRate = Math.max(0.25, video.playbackRate - 0.25);
+                const newDownRate = Math.max(0.25, (video.playbackRate || 1) - 0.25);
+                applySpeed(video, newDownRate);
                 break;
         }
     }, true);
