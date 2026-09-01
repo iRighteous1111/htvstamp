@@ -1,14 +1,18 @@
 // ==UserScript==
-// @name         EBA Video Kontrolcüsü & Otomatik Tamamlayıcı
+// @name         ÖBA Video Kontrolcüsü & Otomatik Tamamlayıcı
 // @namespace    http://tampermonkey.net/
-// @version      0.4
-// @description  EBA (eba.gov.tr & meb.gov.tr) için video kontrolcüsü, son saniyelere sarma ve otomatik tuş tetikleyici (Ctrl + Alt + .)
+// @version      0.5
+// @description  ÖBA (oba.gov.tr) ve EBA için video kontrolcüsü, son saniyelere sarma ve otomatik tuş tetikleyici (Ctrl + Alt + .)
+// @match        *://*.oba.gov.tr/*
+// @match        *://oba.gov.tr/*
 // @match        *://*.eba.gov.tr/*
 // @match        *://eba.gov.tr/*
 // @match        *://*.meb.gov.tr/*
 // @match        *://meb.gov.tr/*
+// @include      *://*oba.gov.tr/*
 // @include      *://*eba.gov.tr/*
 // @include      *://*meb.gov.tr/*
+// @include      *oba.gov.tr*
 // @include      *eba.gov.tr*
 // @include      *meb.gov.tr*
 // @grant        none
@@ -35,7 +39,7 @@
     // Ayarları LocalStorage'dan Yükle
     let settings = defaultSettings;
     try {
-        const saved = localStorage.getItem('ebaVideoControllerSettings');
+        const saved = localStorage.getItem('obaVideoControllerSettings') || localStorage.getItem('ebaVideoControllerSettings');
         if (saved) settings = Object.assign({}, defaultSettings, JSON.parse(saved));
     } catch(e) {
         console.warn('LocalStorage erişim hatası:', e);
@@ -104,7 +108,7 @@
                 <!-- Başlık & Sürükleme Barı -->
                 <div id="vc-header-drag" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2e303e; padding-bottom: 8px; margin-bottom: 12px; cursor: move;">
                     <h3 style="margin: 0; font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 6px; color: #00cec9; pointer-events: none;">
-                        <span>⚡</span> EBA Video Asistanı
+                        <span>⚡</span> ÖBA Video Asistanı
                     </h3>
                     <button id="vc-toggle-btn" style="background: #252733; border: 1px solid #444; color: #fff; cursor: pointer; font-size: 12px; border-radius: 6px; padding: 2px 8px; transition: 0.2s;">➖</button>
                 </div>
@@ -242,7 +246,7 @@
             settings.endOffsetSec = parseInt(endOffsetSlider.value, 10) || 2;
 
             try {
-                localStorage.setItem('ebaVideoControllerSettings', JSON.stringify(settings));
+                localStorage.setItem('obaVideoControllerSettings', JSON.stringify(settings));
             } catch(e) {}
             showStatus('✅ Ayarlar Kaydedildi!', 2000, '#00b894', 'rgba(0, 184, 148, 0.15)');
         });
