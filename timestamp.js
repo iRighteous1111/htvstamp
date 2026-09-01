@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ÖBA Video Kontrolcüsü & Tam Otomatik Geçici
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  ÖBA (oba.gov.tr) ve EBA için video içi kontrolcüsü: X saniye ileri sarar, 1 sn bekler ve Ctrl+Alt+. ile videoyu geçer. Tam otomatik mod seçeneği içerir.
+// @version      1.1
+// @description  ÖBA (oba.gov.tr) ve EBA için video içi kontrolcüsü: Gelişmiş bekleme süreleri, yeşil/kırmızı şalter butonlu tam otomatik döngü ve ileri sarma asistanı.
 // @match        *://*.oba.gov.tr/*
 // @match        *://oba.gov.tr/*
 // @match        *://*.eba.gov.tr/*
@@ -36,7 +36,7 @@
         return originalAddEventListener.apply(this, arguments);
     };
 
-    // Arka plan (Blur) Koruması - Sekme değiştiğinde video durmasın
+    // Arka plan (Blur) Koruması
     try {
         window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
         window.addEventListener('focusout', (e) => e.stopImmediatePropagation(), true);
@@ -182,6 +182,8 @@
     const defaultSettings = {
         forwardKey: 'l',
         skipTime: 10,
+        postPassDelay: 4,     // Video geçildikten sonraki yüklenme/oturma bekleme süresi (sn)
+        prePassDelay: 1.5,    // İleri sarıldıktan sonra tuşlamadan önceki bekleme süresi (sn)
         autoMode: false
     };
 
@@ -196,11 +198,11 @@
     let settings = getSettings();
 
     // ==========================================
-    // 4. ANA İŞLEM: İLERİ SAR + 1 SN BEKLE + GEÇ
+    // 4. İLERLET & BEKLE & GEÇ DÖNGÜSÜ
     // ==========================================
     let isProcessing = false;
 
-    async function executeSkipAndPass(showStatusCallback) {
+    async function executeSkipAndPass(customSkipSecs, customPrePassDelay, showStatusCallback) {
         if (isProcessing) return;
         const video = getVideo();
         if (!video) {
@@ -209,16 +211,17 @@
         }
 
         isProcessing = true;
-        const skipSecs = settings.skipTime || 10;
+        const skipSecs = customSkipSecs || settings.skipTime || 10;
+        const waitDelay = (customPrePassDelay !== undefined ? customPrePassDelay : settings.prePassDelay) || 1.5;
 
         if (showStatusCallback) showStatusCallback(`⏳ ${skipSecs} sn ileri sarılıyor...`, 0, '#ffeaa7');
 
         // 1. İleri sar
         forceSeek(video, video.currentTime + skipSecs);
 
-        // 2. 1 saniye bekle
-        if (showStatusCallback) showStatusCallback('⏳ 1 saniye bekleniyor...', 0, '#74b9ff');
-        await sleep(1000);
+        // 2. Belirlenen süre kadar bekle
+        if (showStatusCallback) showStatusCallback(`⏳ ${waitDelay} sn bekleniyor...`, 0, '#74b9ff');
+        await sleep(waitDelay * 1000);
 
         // 3. Ctrl + Alt + . bas
         await triggerCtrlAltDot();
@@ -228,7 +231,7 @@
     }
 
     // ==========================================
-    // 5. TAM OTOMATİK MOD DÖNGÜSÜ
+    // 5. TAM OTOMATİK MOD DÖNGÜSÜ (LEVER KONTROLLÜ)
     // ==========================================
     let lastProcessedVideoSrc = '';
 
@@ -240,30 +243,41 @@
 
         const currentSrc = video.currentSrc || video.src || window.location.href;
         
-        // Yeni bir video yüklendiğinde veya henüz işlenmediğinde
+        // Yeni bir video tespit edildiğinde
         if (currentSrc && currentSrc !== lastProcessedVideoSrc && !video.dataset.obaHandled) {
             video.dataset.obaHandled = 'true';
             lastProcessedVideoSrc = currentSrc;
 
-            // Videonun başlaması ve oturması için 1.5 sn doğal bekleme
-            await sleep(1500);
+            const postDelay = settings.postPassDelay || 4;
 
-            if (settings.autoMode) {
-                executeSkipAndPass((msg, dur, col) => {
-                    if (window.__obaShowStatus) window.__obaShowStatus(`🔁 [Otomatik]: ${msg}`, dur, col);
-                });
+            if (window.__obaShowStatus) {
+                window.__obaShowStatus(`🔁 Yeni video algılandı, ${postDelay} sn bekleniyor...`, 0, '#ffeaa7');
             }
+
+            // Videonun oturması için kullanıcı tarafından belirlenen süre kadar bekle
+            for (let i = postDelay; i > 0; i--) {
+                if (!settings.autoMode) return; // Kullanıcı durdurduysa çık
+                if (window.__obaShowStatus) {
+                    window.__obaShowStatus(`🔁 Video yükleniyor... (${i} sn kaldı)`, 0, '#ffeaa7');
+                }
+                await sleep(1000);
+            }
+
+            if (!settings.autoMode) return;
+
+            // İleri sar, bekle ve geç
+            await executeSkipAndPass(settings.skipTime, settings.prePassDelay, (msg, dur, col) => {
+                if (window.__obaShowStatus) window.__obaShowStatus(`🔁 [Otomatik]: ${msg}`, dur, col);
+            });
         }
     }
 
-    // Periyodik otomatik mod kontrolü
     setInterval(checkAutoMode, 1000);
 
     // ==========================================
-    // 6. SADECE VİDEO OLAN YERDE GUI OLUŞTUR
+    // 6. GUI OLUŞTURUCU (ŞALTERLİ & AYAR PANELLİ)
     // ==========================================
     function createGUI() {
-        // Videonun olmadığı dış sayfalarda GUI ÇIKARMA (Gereksiz fazlalık önlenir)
         const video = getVideo();
         if (!video && !document.querySelector('.vjs-tech') && !document.querySelector('.video-js')) {
             return;
@@ -272,8 +286,10 @@
         if (document.getElementById('vc-gui-container')) return;
         if (!document.body) return;
 
+        const isAuto = settings.autoMode;
+
         const guiHTML = `
-            <div id="vc-gui-container" style="position: fixed; top: 15px; right: 15px; width: 280px; background: rgba(18, 20, 26, 0.96); color: #f0f0f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 10px; padding: 12px; z-index: 2147483647; box-shadow: 0 8px 32px rgba(0,0,0,0.85); border: 1px solid #33384a; font-size: 12px; user-select: none; backdrop-filter: blur(10px);">
+            <div id="vc-gui-container" style="position: fixed; top: 15px; right: 15px; width: 295px; background: rgba(18, 20, 26, 0.97); color: #f0f0f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 12px; padding: 12px; z-index: 2147483647; box-shadow: 0 10px 35px rgba(0,0,0,0.9); border: 1px solid #33384a; font-size: 12px; user-select: none; backdrop-filter: blur(12px);">
                 <!-- Başlık & Sürükleme -->
                 <div id="vc-header-drag" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #282c3c; padding-bottom: 6px; margin-bottom: 10px; cursor: move;">
                     <h3 style="margin: 0; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 5px; color: #00cec9; pointer-events: none;">
@@ -283,41 +299,65 @@
                 </div>
                 
                 <div id="vc-gui-content">
-                    <!-- İleri Sarma Miktarı Slider -->
-                    <div style="background: #171922; padding: 8px; border-radius: 6px; margin-bottom: 10px; border: 1px solid #282c3c;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                            <span style="font-weight: 600; font-size: 11px; color: #00d2d3;">İleri Sarma Süresi:</span>
-                            <span id="vc-skip-val" style="font-weight: 700; color: #00d2d3; font-size: 12px;">${settings.skipTime} sn</span>
-                        </div>
-                        <input type="range" id="vc-skip-slider" min="5" max="120" step="5" value="${settings.skipTime}" style="width: 100%; accent-color: #00d2d3; cursor: pointer; margin-bottom: 8px;">
-                        
-                        <!-- Ana Eylem Butonları -->
-                        <div style="display: flex; gap: 6px; margin-bottom: 8px;">
-                            <button id="vc-main-btn" style="flex: 2; padding: 9px; background: linear-gradient(135deg, #00b894, #00cec9); color: #fff; border: none; border-radius: 5px; cursor: pointer; font-weight: 700; font-size: 11px; box-shadow: 0 3px 10px rgba(0,206,201,0.25); transition: 0.2s;">
-                                ⏩ <span id="vc-btn-sec">${settings.skipTime}</span>sn Sar & Geç
-                            </button>
-                            <button id="vc-instant-pass-btn" title="Beklemeden Ctrl+Alt+. gönderir" style="flex: 1; padding: 9px; background: #e17055; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-weight: 700; font-size: 11px; box-shadow: 0 3px 10px rgba(225,112,85,0.25);">
-                                ⚡ Geç
-                            </button>
-                        </div>
+                    <!-- ANA ŞALTER (LEVER) BUTONU -->
+                    <button id="vc-lever-btn" style="width: 100%; padding: 11px; margin-bottom: 8px; border: none; border-radius: 6px; cursor: pointer; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; transition: all 0.3s ease; box-shadow: 0 4px 15px ${isAuto ? 'rgba(214,48,49,0.4)' : 'rgba(0,184,148,0.4)'}; background: ${isAuto ? 'linear-gradient(135deg, #d63031, #e17055)' : 'linear-gradient(135deg, #00b894, #00cec9)'}; color: #fff;">
+                        ${isAuto ? '🔴 Otomatik Mod: ÇALIŞIYOR (Durdur)' : '🟢 Otomatik Mod: HAZIR (Başlat)'}
+                    </button>
 
-                        <!-- Tam Otomatik Checkbox -->
-                        <label style="display: flex; align-items: center; gap: 6px; font-size: 11px; color: #ffeaa7; cursor: pointer; background: #202430; padding: 6px 8px; border-radius: 5px; border: 1px solid #383e54;">
-                            <input type="checkbox" id="vc-auto-checkbox" ${settings.autoMode ? 'checked' : ''} style="cursor: pointer; accent-color: #00cec9; width: 14px; height: 14px;">
-                            <span style="font-weight: 600;">🔁 Tam Otomatik Mod (Sırayla Bitir)</span>
-                        </label>
+                    <!-- Tek Seferlik Hızlı Aksiyonlar -->
+                    <div style="display: flex; gap: 6px; margin-bottom: 10px;">
+                        <button id="vc-main-btn" style="flex: 2; padding: 7px; background: #2f3542; color: #fff; border: 1px solid #485460; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 11px;">
+                            ⏩ <span id="vc-btn-sec">${settings.skipTime}</span>sn Sar & Geç
+                        </button>
+                        <button id="vc-instant-pass-btn" title="Beklemeden doğrudan Ctrl+Alt+. gönderir" style="flex: 1; padding: 7px; background: #353b48; color: #f5f6fa; border: 1px solid #485460; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 11px;">
+                            ⚡ Hemen Geç
+                        </button>
                     </div>
 
-                    <!-- Kısayol Ayarı -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; background: #171922; padding: 6px 8px; border-radius: 6px; margin-bottom: 10px; border: 1px solid #282c3c;">
-                        <span style="font-size: 11px; color: #a4b0be;">İleri Sar Tuşu:</span>
-                        <input type="text" id="vc-fwd-key" value="${settings.forwardKey}" maxlength="1" style="width: 45px; padding: 3px; box-sizing: border-box; background: #232736; color: #fff; border: 1px solid #3d4358; text-align: center; border-radius: 4px; outline: none; font-size: 11px; font-weight: bold;">
+                    <!-- OTOMATİK MOD AYARLARI BÖLÜMÜ -->
+                    <div style="background: #171922; padding: 10px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #282c3c;">
+                        <div style="font-size: 11px; font-weight: 700; color: #00cec9; margin-bottom: 8px; display: flex; align-items: center; gap: 4px;">
+                            <span>⚙️</span> Otomatik Mod Ayarları
+                        </div>
+
+                        <!-- 1. İleri Sarma Süresi -->
+                        <div style="margin-bottom: 8px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px; color: #a4b0be;">
+                                <span>İleri Sarma Miktarı:</span>
+                                <span id="vc-skip-val" style="font-weight: 700; color: #00d2d3;">${settings.skipTime} sn</span>
+                            </div>
+                            <input type="range" id="vc-skip-slider" min="5" max="120" step="5" value="${settings.skipTime}" style="width: 100%; accent-color: #00d2d3; cursor: pointer;">
+                        </div>
+
+                        <!-- 2. Videoyu Geçtikten Sonra Bekleme Süresi (Yüklenme) -->
+                        <div style="margin-bottom: 8px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px; color: #a4b0be;">
+                                <span>Yeni Video Yüklenme Beklemesi:</span>
+                                <span id="vc-post-val" style="font-weight: 700; color: #ffeaa7;">${settings.postPassDelay} sn</span>
+                            </div>
+                            <input type="range" id="vc-post-slider" min="1" max="20" step="1" value="${settings.postPassDelay}" style="width: 100%; accent-color: #ffeaa7; cursor: pointer;">
+                        </div>
+
+                        <!-- 3. Tuşlamadan Önce Bekleme Süresi -->
+                        <div style="margin-bottom: 8px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px; color: #a4b0be;">
+                                <span>Tuşlamadan Önceki Bekleme:</span>
+                                <span id="vc-pre-val" style="font-weight: 700; color: #74b9ff;">${settings.prePassDelay} sn</span>
+                            </div>
+                            <input type="range" id="vc-pre-slider" min="0.5" max="5" step="0.5" value="${settings.prePassDelay}" style="width: 100%; accent-color: #74b9ff; cursor: pointer;">
+                        </div>
+
+                        <!-- Kısayol Tuşu -->
+                        <div style="display: flex; justify-content: space-between; align-items: center; padding-top: 4px; border-top: 1px solid #232736;">
+                            <span style="font-size: 10px; color: #a4b0be;">Manuel İleri Sar Tuşu:</span>
+                            <input type="text" id="vc-fwd-key" value="${settings.forwardKey}" maxlength="1" style="width: 35px; padding: 2px; box-sizing: border-box; background: #232736; color: #fff; border: 1px solid #3d4358; text-align: center; border-radius: 4px; outline: none; font-size: 11px; font-weight: bold;">
+                        </div>
                     </div>
                     
-                    <button id="vc-save-btn" style="width: 100%; padding: 6px; background: #2b3040; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px; transition: 0.2s;">
+                    <button id="vc-save-btn" style="width: 100%; padding: 6px; background: #2b3040; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 11px; transition: 0.2s;">
                         💾 Ayarları Kaydet
                     </button>
-                    <div id="vc-status" style="font-size: 10px; color: #00cec9; text-align: center; margin-top: 6px; display: none; line-height: 1.3; padding: 4px; border-radius: 4px;"></div>
+                    <div id="vc-status" style="font-size: 10px; color: #00cec9; text-align: center; margin-top: 6px; display: none; line-height: 1.3; padding: 5px; border-radius: 4px; font-weight: 600;"></div>
                 </div>
             </div>
         `;
@@ -330,13 +370,21 @@
         const container = document.getElementById('vc-gui-container');
         const content = document.getElementById('vc-gui-content');
         const toggleBtn = document.getElementById('vc-toggle-btn');
+        const leverBtn = document.getElementById('vc-lever-btn');
         const saveBtn = document.getElementById('vc-save-btn');
         const mainBtn = document.getElementById('vc-main-btn');
         const instantPassBtn = document.getElementById('vc-instant-pass-btn');
+        
         const skipSlider = document.getElementById('vc-skip-slider');
         const skipValText = document.getElementById('vc-skip-val');
         const btnSecText = document.getElementById('vc-btn-sec');
-        const autoCheckbox = document.getElementById('vc-auto-checkbox');
+
+        const postSlider = document.getElementById('vc-post-slider');
+        const postValText = document.getElementById('vc-post-val');
+
+        const preSlider = document.getElementById('vc-pre-slider');
+        const preValText = document.getElementById('vc-pre-val');
+
         const statusText = document.getElementById('vc-status');
         const headerDrag = document.getElementById('vc-header-drag');
 
@@ -353,7 +401,7 @@
             }
         };
 
-        // Slider Değişimi
+        // Slider Dinleyicileri
         skipSlider.addEventListener('input', (e) => {
             const val = parseInt(e.target.value, 10);
             skipValText.textContent = `${val} sn`;
@@ -361,17 +409,45 @@
             settings.skipTime = val;
         });
 
-        // Checkbox Değişimi (Anında kaydeder)
-        autoCheckbox.addEventListener('change', (e) => {
-            settings.autoMode = e.target.checked;
+        postSlider.addEventListener('input', (e) => {
+            const val = parseInt(e.target.value, 10);
+            postValText.textContent = `${val} sn`;
+            settings.postPassDelay = val;
+        });
+
+        preSlider.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            preValText.textContent = `${val} sn`;
+            settings.prePassDelay = val;
+        });
+
+        // ŞALTER (LEVER) BUTONU: TIKLANDIKÇA KIRMIZI / YEŞİL DÖNÜŞÜMÜ
+        const updateLeverButtonState = () => {
+            if (settings.autoMode) {
+                leverBtn.textContent = '🔴 Otomatik Mod: ÇALIŞIYOR (Durdur)';
+                leverBtn.style.background = 'linear-gradient(135deg, #d63031, #e17055)';
+                leverBtn.style.boxShadow = '0 4px 15px rgba(214,48,49,0.5)';
+            } else {
+                leverBtn.textContent = '🟢 Otomatik Mod: HAZIR (Başlat)';
+                leverBtn.style.background = 'linear-gradient(135deg, #00b894, #00cec9)';
+                leverBtn.style.boxShadow = '0 4px 15px rgba(0,184,148,0.4)';
+            }
+        };
+
+        leverBtn.addEventListener('click', () => {
+            settings.autoMode = !settings.autoMode;
             try {
                 localStorage.setItem('obaVideoControllerSettings', JSON.stringify(settings));
             } catch (err) {}
+            
+            updateLeverButtonState();
+
             if (settings.autoMode) {
-                window.__obaShowStatus('🔁 Tam Otomatik Mod Aktif Edildi!', 2000, '#ffeaa7');
+                window.__obaShowStatus('🟢 Otomatik Mod Başlatıldı! Sırayla ilerleyecek.', 2000, '#55efc4');
+                lastProcessedVideoSrc = ''; // Hemen geçerli videoyu işle
                 checkAutoMode();
             } else {
-                window.__obaShowStatus('⏸️ Otomatik Mod Kapatıldı.', 2000, '#a4b0be');
+                window.__obaShowStatus('🔴 Otomatik Mod Durduruldu.', 2000, '#ff7675');
             }
         });
 
@@ -419,17 +495,18 @@
         saveBtn.addEventListener('click', () => {
             settings.forwardKey = document.getElementById('vc-fwd-key').value.toLowerCase();
             settings.skipTime = parseInt(skipSlider.value, 10) || 10;
-            settings.autoMode = autoCheckbox.checked;
+            settings.postPassDelay = parseInt(postSlider.value, 10) || 4;
+            settings.prePassDelay = parseFloat(preSlider.value) || 1.5;
 
             try {
                 localStorage.setItem('obaVideoControllerSettings', JSON.stringify(settings));
             } catch (e) {}
-            window.__obaShowStatus('✅ Ayarlar Kaydedildi!', 2000, '#00b894');
+            window.__obaShowStatus('✅ Tüm Ayarlar Kaydedildi!', 2000, '#00b894');
         });
 
-        // Ana Buton: İleri Sar + 1 sn Bekle + Geç
+        // Tek Seferlik Manuel İşlem
         mainBtn.addEventListener('click', () => {
-            executeSkipAndPass(window.__obaShowStatus);
+            executeSkipAndPass(settings.skipTime, settings.prePassDelay, window.__obaShowStatus);
         });
 
         // Doğrudan Hemen Geç Butonu
@@ -440,7 +517,7 @@
         });
     }
 
-    // --- KLAVYE DİNLEYİCİSİ (SADECE İLERİ SARMA) ---
+    // --- KLAVYE DİNLEYİCİSİ ---
     document.addEventListener('keydown', function(e) {
         const activeTag = e.target.tagName ? e.target.tagName.toLowerCase() : '';
         if (activeTag === 'input' || activeTag === 'textarea' || e.target.isContentEditable) return;
