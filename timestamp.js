@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ÖBA Video Kontrolcüsü & Otomatik Tamamlayıcı
 // @namespace    http://tampermonkey.net/
-// @version      0.8
-// @description  ÖBA (oba.gov.tr) ve EBA için anti-atlama engelini kaldıran, videoyu anında son saniyelere saran, hızlandıran ve bitince Ctrl+Alt+. tetikleyen tam kontrolcü
+// @version      0.9
+// @description  ÖBA (oba.gov.tr) ve EBA için kesin çalışan video kontrolcüsü, son saniyelere sarma, hızlandırma, ilerleme çubuğu simülasyonu ve otomatik tuş tetikleyici (Ctrl + Alt + .)
 // @match        *://*.oba.gov.tr/*
 // @match        *://oba.gov.tr/*
 // @match        *://*.eba.gov.tr/*
@@ -26,14 +26,10 @@
     // ==========================================
     // 1. SİTE ENGELLEMELERİNİ NÖTRALİZE ETME
     // ==========================================
-
-    // Sitenin 'seeking' (sarma) ve 'ratechange' (hız) olaylarını dinleyip süreyi geri almasını engelle
     const originalAddEventListener = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, listener, options) {
-        // Eğer bir video veya oynatıcı 'seeking' engelleyicisi eklemeye çalışıyorsa engelle
         if (type === 'seeking' || type === 'ratechange') {
             if (this instanceof HTMLMediaElement || (this && this.tagName === 'VIDEO')) {
-                // Sitenin araya girip süreyi geri almasını önle
                 return;
             }
         }
@@ -54,7 +50,7 @@
     } catch (e) {}
 
     // ==========================================
-    // 2. VİDEO YÖNETİMİ & GERÇEK ZAMAN SARMA
+    // 2. GELİŞMİŞ VİDEO SARMA & HIZLANDIRMA
     // ==========================================
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -62,29 +58,55 @@
         return document.querySelector('video');
     }
 
-    // VideoJS / Oynatıcı nesnelerinin engellerini kaldır ve zamanı ayarla
-    function applyTime(video, targetTime) {
+    // İlerleme çubuğuna (Progress Bar) doğrudan tıklama simülasyonu
+    function simulateProgressBarClick(percent) {
+        const selectors = [
+            '.vjs-progress-holder',
+            '.vjs-progress-control',
+            '.vjs-slider',
+            '.plyr__progress input',
+            '.jw-slider-time',
+            '[role="slider"]',
+            '.progress-bar',
+            '.video-progress'
+        ];
+
+        for (const sel of selectors) {
+            const bar = document.querySelector(sel);
+            if (bar) {
+                const rect = bar.getBoundingClientRect();
+                if (rect.width > 0) {
+                    const clickX = rect.left + (rect.width * Math.max(0, Math.min(0.99, percent)));
+                    const clickY = rect.top + (rect.height / 2);
+
+                    ['mousedown', 'mouseup', 'click'].forEach(eventType => {
+                        const evt = new MouseEvent(eventType, {
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: clickX,
+                            clientY: clickY,
+                            view: window
+                        });
+                        bar.dispatchEvent(evt);
+                    });
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Videoyu kesin olarak hedeflenen zamana sar
+    function forceSeek(video, targetTime) {
         if (!video) return;
 
-        // 1. Video.js Oynatıcılarını Çöz
+        // 1. FastSeek ve Standart Setter
         try {
-            if (window.videojs) {
-                const players = window.videojs.getAllPlayers ? window.videojs.getAllPlayers() : Object.values(window.videojs.players || {});
-                players.forEach(player => {
-                    if (player) {
-                        try { if (player.off) player.off('seeking'); } catch(e) {}
-                        if (typeof player.currentTime === 'function') {
-                            player.currentTime(targetTime);
-                        }
-                        if (player.paused && typeof player.play === 'function') {
-                            player.play();
-                        }
-                    }
-                });
+            if (typeof video.fastSeek === 'function') {
+                video.fastSeek(targetTime);
             }
         } catch (e) {}
 
-        // 2. HTMLMediaElement Prototype Setter
         try {
             const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
             if (descriptor && descriptor.set) {
@@ -92,11 +114,30 @@
             } else {
                 video.currentTime = targetTime;
             }
-        } catch (err) {
+        } catch (e) {
             video.currentTime = targetTime;
         }
 
-        // 3. Eventleri tetikle
+        // 2. Video.js Oynatıcılarını Sar
+        try {
+            if (window.videojs) {
+                const players = window.videojs.getAllPlayers ? window.videojs.getAllPlayers() : Object.values(window.videojs.players || {});
+                players.forEach(player => {
+                    if (player) {
+                        try { if (player.off) player.off('seeking'); } catch (err) {}
+                        if (typeof player.currentTime === 'function') player.currentTime(targetTime);
+                        if (player.paused && typeof player.play === 'function') player.play();
+                    }
+                });
+            }
+        } catch (e) {}
+
+        // 3. İlerleme çubuğuna tıklatarak arayüzü zorla
+        if (video.duration > 0) {
+            simulateProgressBarClick(targetTime / video.duration);
+        }
+
+        // 4. Eventleri tetikle ve oynat
         try {
             video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
             video.dispatchEvent(new Event('seeked', { bubbles: true }));
@@ -107,8 +148,8 @@
         }
     }
 
-    // Hızı Zorla Ayarla
-    function applySpeed(video, rate) {
+    // Hızı Ayarla
+    function setSpeed(video, rate) {
         if (!video) return;
         video.playbackRate = rate;
 
@@ -124,7 +165,7 @@
 
     // "Ctrl + Alt + ." Tuş Kombinasyonunu Tetikle
     async function triggerCtrlAltDot() {
-        await sleep(500);
+        await sleep(400);
 
         const eventOptions = {
             key: '.',
@@ -140,8 +181,8 @@
         };
 
         const targets = [document.activeElement, document.body, document, window];
-        try { if (window.parent && window.parent !== window) targets.push(window.parent.document, window.parent); } catch(e){}
-        try { if (window.top && window.top !== window) targets.push(window.top.document, window.top); } catch(e){}
+        try { if (window.parent && window.parent !== window) targets.push(window.parent.document, window.parent); } catch (e) {}
+        try { if (window.top && window.top !== window) targets.push(window.top.document, window.top); } catch (e) {}
 
         targets.forEach(target => {
             if (target && target.dispatchEvent) {
@@ -149,13 +190,13 @@
                     target.dispatchEvent(new KeyboardEvent('keydown', eventOptions));
                     target.dispatchEvent(new KeyboardEvent('keypress', eventOptions));
                     target.dispatchEvent(new KeyboardEvent('keyup', eventOptions));
-                } catch(e) {}
+                } catch (e) {}
             }
         });
     }
 
     // ==========================================
-    // 3. GUI VE AYARLAR
+    // 3. GUI VE ETKİLEŞİM
     // ==========================================
     const defaultSettings = {
         forwardKey: 'l',
@@ -181,59 +222,76 @@
         if (!document.body) return;
 
         const guiHTML = `
-            <div id="vc-gui-container" style="position: fixed; top: 15px; right: 15px; width: 290px; background: rgba(20, 21, 27, 0.95); color: #f0f0f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 10px; padding: 12px; z-index: 2147483647; box-shadow: 0 8px 30px rgba(0,0,0,0.8); border: 1px solid #33374a; font-size: 12px; user-select: none; backdrop-filter: blur(8px);">
+            <div id="vc-gui-container" style="position: fixed; top: 15px; right: 15px; width: 295px; background: rgba(18, 20, 26, 0.96); color: #f0f0f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 10px; padding: 12px; z-index: 2147483647; box-shadow: 0 8px 32px rgba(0,0,0,0.85); border: 1px solid #33384a; font-size: 12px; user-select: none; backdrop-filter: blur(10px);">
                 <!-- Başlık & Sürükleme -->
-                <div id="vc-header-drag" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2d3142; padding-bottom: 6px; margin-bottom: 10px; cursor: move;">
+                <div id="vc-header-drag" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #282c3c; padding-bottom: 6px; margin-bottom: 10px; cursor: move;">
                     <h3 style="margin: 0; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 5px; color: #00cec9; pointer-events: none;">
                         <span>⚡</span> ÖBA Video Kontrol
                     </h3>
-                    <button id="vc-toggle-btn" style="background: #252836; border: 1px solid #444a60; color: #fff; cursor: pointer; font-size: 11px; border-radius: 4px; padding: 2px 6px;">➖</button>
+                    <button id="vc-toggle-btn" style="background: #232736; border: 1px solid #42475c; color: #fff; cursor: pointer; font-size: 11px; border-radius: 4px; padding: 2px 6px;">➖</button>
                 </div>
                 
                 <div id="vc-gui-content">
                     <!-- Sona Sar & Tuşla Bölümü -->
-                    <div style="background: #191b24; padding: 8px; border-radius: 6px; margin-bottom: 10px; border: 1px solid #2d3142;">
+                    <div style="background: #171922; padding: 8px; border-radius: 6px; margin-bottom: 10px; border: 1px solid #282c3c;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                             <span style="font-weight: 600; font-size: 11px; color: #00d2d3;">Kalan Süre (Bitişe kala):</span>
                             <span id="vc-offset-val" style="font-weight: 700; color: #00d2d3; font-size: 12px;">${settings.endOffsetSec} sn</span>
                         </div>
                         <input type="range" id="vc-end-offset" min="1" max="30" step="1" value="${settings.endOffsetSec}" style="width: 100%; accent-color: #00d2d3; cursor: pointer; margin-bottom: 8px;">
                         
-                        <button id="vc-skip-end-btn" style="width: 100%; padding: 8px; background: linear-gradient(135deg, #00b894, #00cec9); color: #fff; border: none; border-radius: 5px; cursor: pointer; font-weight: 700; font-size: 11px; box-shadow: 0 3px 10px rgba(0,206,201,0.3); transition: 0.2s;">
-                            ⏩ Sona Sar & Bitince Tuşla (Ctrl+Alt+.)
-                        </button>
+                        <div style="display: flex; gap: 6px; margin-bottom: 6px;">
+                            <button id="vc-skip-end-btn" style="flex: 2; padding: 8px; background: linear-gradient(135deg, #00b894, #00cec9); color: #fff; border: none; border-radius: 5px; cursor: pointer; font-weight: 700; font-size: 11px; box-shadow: 0 3px 10px rgba(0,206,201,0.25); transition: 0.2s;">
+                                ⏩ Sona Sar & Geç
+                            </button>
+                            <button id="vc-instant-pass-btn" title="Doğrudan Ctrl+Alt+. kombinasyonunu basar" style="flex: 1; padding: 8px; background: #e17055; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-weight: 700; font-size: 11px; box-shadow: 0 3px 10px rgba(225,112,85,0.25);">
+                                ⚡ Hemen Geç
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Hızlı Hız Seçici -->
+                    <div style="display: flex; align-items: center; justify-content: space-between; background: #171922; padding: 6px 8px; border-radius: 6px; margin-bottom: 10px; border: 1px solid #282c3c;">
+                        <span style="font-size: 11px; color: #a4b0be; font-weight: 600;">Hız:</span>
+                        <div style="display: flex; gap: 4px;">
+                            <button class="vc-speed-btn" data-speed="1" style="background: #252a3a; color: #fff; border: 1px solid #3c435c; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">1x</button>
+                            <button class="vc-speed-btn" data-speed="2" style="background: #252a3a; color: #fff; border: 1px solid #3c435c; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">2x</button>
+                            <button class="vc-speed-btn" data-speed="4" style="background: #252a3a; color: #fff; border: 1px solid #3c435c; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">4x</button>
+                            <button class="vc-speed-btn" data-speed="8" style="background: #252a3a; color: #fff; border: 1px solid #3c435c; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">8x</button>
+                            <button class="vc-speed-btn" data-speed="16" style="background: #00b894; color: #fff; border: none; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: bold; cursor: pointer;">16x</button>
+                        </div>
                     </div>
 
                     <!-- Kısayollar -->
-                    <div style="font-size: 10px; color: #8892b0; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">Klavye Kısayolları</div>
+                    <div style="font-size: 10px; color: #7f8fa6; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">Klavye Kısayolları</div>
                     
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px;">
                         <div>
                             <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">İleri Sar</label>
-                            <input type="text" id="vc-fwd-key" value="${settings.forwardKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
+                            <input type="text" id="vc-fwd-key" value="${settings.forwardKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #171922; color: #fff; border: 1px solid #33384a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div>
                             <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Geri Sar</label>
-                            <input type="text" id="vc-bwd-key" value="${settings.backwardKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
+                            <input type="text" id="vc-bwd-key" value="${settings.backwardKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #171922; color: #fff; border: 1px solid #33384a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div>
                             <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Hızlandır</label>
-                            <input type="text" id="vc-sup-key" value="${settings.speedUpKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
+                            <input type="text" id="vc-sup-key" value="${settings.speedUpKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #171922; color: #fff; border: 1px solid #33384a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div>
                             <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Yavaşlat</label>
-                            <input type="text" id="vc-sdwn-key" value="${settings.speedDownKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
+                            <input type="text" id="vc-sdwn-key" value="${settings.speedDownKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #171922; color: #fff; border: 1px solid #33384a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div style="grid-column: span 2;">
                             <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Atlama Miktarı (Saniye)</label>
-                            <input type="number" id="vc-skip-time" value="${settings.skipTime}" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; border-radius: 4px; outline: none; font-size: 11px;">
+                            <input type="number" id="vc-skip-time" value="${settings.skipTime}" style="width: 100%; padding: 4px; box-sizing: border-box; background: #171922; color: #fff; border: 1px solid #33384a; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                     </div>
                     
-                    <button id="vc-save-btn" style="width: 100%; padding: 6px; background: #2f3542; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px; transition: 0.2s;">
+                    <button id="vc-save-btn" style="width: 100%; padding: 6px; background: #2b3040; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px; transition: 0.2s;">
                         💾 Ayarları Kaydet
                     </button>
-                    <div id="vc-status" style="font-size: 10px; color: #00cec9; text-align: center; margin-top: 6px; display: none; line-height: 1.3; padding: 3px; border-radius: 4px;"></div>
+                    <div id="vc-status" style="font-size: 10px; color: #00cec9; text-align: center; margin-top: 6px; display: none; line-height: 1.3; padding: 4px; border-radius: 4px;"></div>
                 </div>
             </div>
         `;
@@ -248,6 +306,7 @@
         const toggleBtn = document.getElementById('vc-toggle-btn');
         const saveBtn = document.getElementById('vc-save-btn');
         const skipEndBtn = document.getElementById('vc-skip-end-btn');
+        const instantPassBtn = document.getElementById('vc-instant-pass-btn');
         const endOffsetSlider = document.getElementById('vc-end-offset');
         const endOffsetVal = document.getElementById('vc-offset-val');
         const statusText = document.getElementById('vc-status');
@@ -257,7 +316,7 @@
             if (!statusText) return;
             statusText.textContent = msg;
             statusText.style.color = color;
-            statusText.style.background = 'rgba(0, 206, 201, 0.1)';
+            statusText.style.background = 'rgba(0, 206, 201, 0.12)';
             statusText.style.display = 'block';
             if (duration > 0) {
                 setTimeout(() => {
@@ -265,6 +324,20 @@
                 }, duration);
             }
         };
+
+        // Hızlı hız butonları
+        document.querySelectorAll('.vc-speed-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const speed = parseFloat(e.target.getAttribute('data-speed'));
+                const video = getVideo();
+                if (video) {
+                    setSpeed(video, speed);
+                    showStatus(`⚡ Oynatma hızı: ${speed}x yapıldı!`, 1500);
+                } else {
+                    showStatus('⚠️ Video bulunamadı!', 2000, '#ff7675');
+                }
+            });
+        });
 
         // Slider Değişimi
         endOffsetSlider.addEventListener('input', (e) => {
@@ -327,6 +400,13 @@
             showStatus('✅ Ayarlar Kaydedildi!', 2000, '#00b894');
         });
 
+        // Doğrudan Geç Butonu
+        instantPassBtn.addEventListener('click', async () => {
+            showStatus('⚡ "Ctrl + Alt + ." gönderiliyor...', 1500, '#ffeaa7');
+            await triggerCtrlAltDot();
+            showStatus('✅ "Ctrl + Alt + ." basıldı!', 2500, '#55efc4');
+        });
+
         // Sona Sar ve Bitişte Tetikle
         skipEndBtn.addEventListener('click', async () => {
             const video = getVideo();
@@ -337,7 +417,7 @@
 
             const duration = video.duration;
             if (!duration || isNaN(duration) || duration <= 0) {
-                showStatus('⚠️ Video süresi henüz yüklenmedi, önce videoyu başlatın!', 3000, '#ff7675');
+                showStatus('⚠️ Video süresi henüz hazır değil, önce videoyu başlatın!', 3000, '#ff7675');
                 return;
             }
 
@@ -346,39 +426,44 @@
 
             showStatus(`⏳ Son ${offset} sn'ye sarılıyor...`, 0, '#ffeaa7');
 
-            // 1. Adım: Sürekli ve zorlayıcı sarma uygula
-            let seekAttempts = 0;
+            // 1. Doğrudan ve zorlayıcı sarma
+            forceSeek(video, targetTime);
+
+            let attempts = 0;
             const seekLoop = setInterval(() => {
-                applyTime(video, targetTime);
-                seekAttempts++;
-                // Video hedef süreye ulaştıysa veya 10 deneme bittiyse durdur
-                if (Math.abs(video.currentTime - targetTime) <= 2 || seekAttempts >= 10) {
+                forceSeek(video, targetTime);
+                attempts++;
+                if (video.currentTime >= targetTime - 1 || attempts >= 8) {
                     clearInterval(seekLoop);
                 }
-            }, 100);
+            }, 150);
 
-            // 2. Adım: Eğer video akışı HLS sebebiyle sarılamadıysa Turbo 16x modunu devreye sok
+            // 2. Eğer video doğrudan atlamadıysa 16x Turbo modunu hemen devreye sok
             setTimeout(() => {
-                if (video.currentTime < targetTime - 5) {
-                    showStatus('⚡ Turbo Hız Modu (16x) Aktif...', 0, '#00d2d3');
-                    applySpeed(video, 16);
+                if (video.currentTime < targetTime - 3) {
+                    showStatus('⚡ 16x Turbo Hız devrede...', 0, '#00cec9');
+                    setSpeed(video, 16);
                 }
-            }, 1200);
+            }, 800);
 
-            // 3. Adım: Gerçekten bitişe ulaşıldığını periyodik olarak kontrol et
-            let checkFinishedInterval = setInterval(async () => {
-                const isNearEnd = (video.currentTime >= video.duration - Math.min(offset, 1.5)) || video.ended;
-                
-                if (isNearEnd && video.duration > 5) {
-                    clearInterval(checkFinishedInterval);
+            // 3. Bitiş Kontrolü (Zaman aşımı korumalı)
+            let checkTime = 0;
+            const finishCheck = setInterval(async () => {
+                checkTime += 250;
+                const isFinished = (video.currentTime >= video.duration - Math.min(offset, 1.5)) || video.ended;
 
-                    showStatus('⏳ Video tamamlandı, bekleniyor...', 0, '#74b9ff');
-                    await sleep(800);
+                // Eğer video sona ulaştıysa veya 6 saniye geçtiyse otomatik tetikle (Asla takılı kalmaz)
+                if (isFinished || checkTime >= 6000) {
+                    clearInterval(finishCheck);
+                    clearInterval(seekLoop);
+
+                    showStatus('⏳ Video bitti, tuşlanıyor...', 0, '#74b9ff');
+                    await sleep(600);
 
                     await triggerCtrlAltDot();
-                    showStatus('✅ "Ctrl + Alt + ." başarıyla basıldı!', 4000, '#55efc4');
+                    showStatus('✅ "Ctrl + Alt + ." başarıyla basıldı!', 3500, '#55efc4');
                 }
-            }, 300);
+            }, 250);
         });
     }
 
@@ -395,18 +480,18 @@
 
         switch(key) {
             case settings.forwardKey:
-                applyTime(video, video.currentTime + skipSecs);
+                forceSeek(video, video.currentTime + skipSecs);
                 break;
             case settings.backwardKey:
-                applyTime(video, Math.max(0, video.currentTime - skipSecs));
+                forceSeek(video, Math.max(0, video.currentTime - skipSecs));
                 break;
             case settings.speedUpKey:
-                const newUpRate = Math.min(16, (video.playbackRate || 1) + 0.5);
-                applySpeed(video, newUpRate);
+                const newUp = Math.min(16, (video.playbackRate || 1) + 0.5);
+                setSpeed(video, newUp);
                 break;
             case settings.speedDownKey:
-                const newDownRate = Math.max(0.25, (video.playbackRate || 1) - 0.25);
-                applySpeed(video, newDownRate);
+                const newDown = Math.max(0.25, (video.playbackRate || 1) - 0.25);
+                setSpeed(video, newDown);
                 break;
         }
     }, true);
