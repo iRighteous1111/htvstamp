@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ÖBA Video Kontrolcüsü & Tam Otomatik Geçici
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  ÖBA (oba.gov.tr) ve EBA için video içi kontrolcüsü: Gelişmiş bekleme süreleri, yeşil/kırmızı şalter butonlu tam otomatik döngü ve ileri sarma asistanı.
+// @version      1.2
+// @description  ÖBA (oba.gov.tr) ve EBA için video içi kontrolcüsü: Kesintisiz çalışan aktif otomatik döngü, ayarlanabilir bekleme süreleri ve şalter kontrollü video geçici.
 // @match        *://*.oba.gov.tr/*
 // @match        *://oba.gov.tr/*
 // @match        *://*.eba.gov.tr/*
@@ -198,7 +198,7 @@
     let settings = getSettings();
 
     // ==========================================
-    // 4. İLERLET & BEKLE & GEÇ DÖNGÜSÜ
+    // 4. İLERLET & BEKLE & GEÇ (TEK SEFERLİK)
     // ==========================================
     let isProcessing = false;
 
@@ -231,48 +231,74 @@
     }
 
     // ==========================================
-    // 5. TAM OTOMATİK MOD DÖNGÜSÜ (LEVER KONTROLLÜ)
+    // 5. KESİNTİSİZ TAM OTOMATİK DÖNGÜ (WORKER)
     // ==========================================
-    let lastProcessedVideoSrc = '';
+    let autoWorkerRunning = false;
 
-    async function checkAutoMode() {
-        if (!settings.autoMode || isProcessing) return;
+    async function runAutoLoop() {
+        if (autoWorkerRunning) return;
+        autoWorkerRunning = true;
 
-        const video = getVideo();
-        if (!video) return;
-
-        const currentSrc = video.currentSrc || video.src || window.location.href;
-        
-        // Yeni bir video tespit edildiğinde
-        if (currentSrc && currentSrc !== lastProcessedVideoSrc && !video.dataset.obaHandled) {
-            video.dataset.obaHandled = 'true';
-            lastProcessedVideoSrc = currentSrc;
-
-            const postDelay = settings.postPassDelay || 4;
-
-            if (window.__obaShowStatus) {
-                window.__obaShowStatus(`🔁 Yeni video algılandı, ${postDelay} sn bekleniyor...`, 0, '#ffeaa7');
+        while (settings.autoMode) {
+            const video = getVideo();
+            if (!video) {
+                if (window.__obaShowStatus) {
+                    window.__obaShowStatus('🔁 [Otomatik]: Video aranıyor...', 0, '#ffeaa7');
+                }
+                await sleep(1000);
+                continue;
             }
 
-            // Videonun oturması için kullanıcı tarafından belirlenen süre kadar bekle
+            // 1. Adım: Yeni video oturması için kullanıcı süresi kadar geri say
+            const postDelay = settings.postPassDelay || 4;
             for (let i = postDelay; i > 0; i--) {
-                if (!settings.autoMode) return; // Kullanıcı durdurduysa çık
+                if (!settings.autoMode) {
+                    autoWorkerRunning = false;
+                    return;
+                }
                 if (window.__obaShowStatus) {
-                    window.__obaShowStatus(`🔁 Video yükleniyor... (${i} sn kaldı)`, 0, '#ffeaa7');
+                    window.__obaShowStatus(`🔁 [Otomatik]: Video yükleniyor... (${i} sn)`, 0, '#ffeaa7');
                 }
                 await sleep(1000);
             }
 
-            if (!settings.autoMode) return;
+            if (!settings.autoMode) break;
 
-            // İleri sar, bekle ve geç
-            await executeSkipAndPass(settings.skipTime, settings.prePassDelay, (msg, dur, col) => {
-                if (window.__obaShowStatus) window.__obaShowStatus(`🔁 [Otomatik]: ${msg}`, dur, col);
-            });
+            // 2. Adım: İleri sar
+            const skipSecs = settings.skipTime || 10;
+            if (window.__obaShowStatus) {
+                window.__obaShowStatus(`⏳ [Otomatik]: ${skipSecs} sn sarılıyor...`, 0, '#00cec9');
+            }
+            forceSeek(video, video.currentTime + skipSecs);
+
+            // 3. Adım: Tuşlamadan önce bekle
+            const preDelay = settings.prePassDelay || 1.5;
+            if (window.__obaShowStatus) {
+                window.__obaShowStatus(`⏳ [Otomatik]: ${preDelay} sn bekleniyor...`, 0, '#74b9ff');
+            }
+            await sleep(preDelay * 1000);
+
+            if (!settings.autoMode) break;
+
+            // 4. Adım: Sonraki videoya geç
+            if (window.__obaShowStatus) {
+                window.__obaShowStatus('⚡ [Otomatik]: "Ctrl + Alt + ." basılıyor...', 0, '#55efc4');
+            }
+            await triggerCtrlAltDot();
+
+            // 5. Adım: Sayfa ve oynatıcı geçişi için 2 sn ara ver
+            await sleep(2000);
         }
+
+        autoWorkerRunning = false;
     }
 
-    setInterval(checkAutoMode, 1000);
+    // Sayfa açıldığında otomatik mod açıksa hemen başlat
+    setTimeout(() => {
+        if (settings.autoMode) {
+            runAutoLoop();
+        }
+    }, 1500);
 
     // ==========================================
     // 6. GUI OLUŞTURUCU (ŞALTERLİ & AYAR PANELLİ)
@@ -444,8 +470,7 @@
 
             if (settings.autoMode) {
                 window.__obaShowStatus('🟢 Otomatik Mod Başlatıldı! Sırayla ilerleyecek.', 2000, '#55efc4');
-                lastProcessedVideoSrc = ''; // Hemen geçerli videoyu işle
-                checkAutoMode();
+                runAutoLoop();
             } else {
                 window.__obaShowStatus('🔴 Otomatik Mod Durduruldu.', 2000, '#ff7675');
             }
