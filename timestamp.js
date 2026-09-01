@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ÖBA Video Kontrolcüsü & Otomatik Tamamlayıcı
 // @namespace    http://tampermonkey.net/
-// @version      0.5
-// @description  ÖBA (oba.gov.tr) ve EBA için video kontrolcüsü, son saniyelere sarma ve otomatik tuş tetikleyici (Ctrl + Alt + .)
+// @version      0.7
+// @description  ÖBA (oba.gov.tr) ve EBA için video içi kontrolcüsü, arka planda çalışma (blur engeli kaldırma), son saniyelere sarma ve otomatik tuş tetikleyici (Ctrl + Alt + .)
 // @match        *://*.oba.gov.tr/*
 // @match        *://oba.gov.tr/*
 // @match        *://*.eba.gov.tr/*
@@ -23,55 +23,82 @@
 (function() {
     'use strict';
 
-    // Sadece üst pencerede veya video içeren çerçevelerde GUI oluştur
-    const isTopWindow = (window.self === window.top);
-
-    // Varsayılan Ayarlar
-    const defaultSettings = {
-        forwardKey: 'l',
-        backwardKey: 'j',
-        speedUpKey: 'h',
-        speedDownKey: 'g',
-        skipTime: 10,
-        endOffsetSec: 2 // Videonun bitimine kaç saniye kala sarılacak
-    };
-
-    // Ayarları LocalStorage'dan Yükle
-    let settings = defaultSettings;
+    // ==========================================
+    // 1. BLUR & ARKAPLAN KORUMASI
+    // ==========================================
     try {
-        const saved = localStorage.getItem('obaVideoControllerSettings') || localStorage.getItem('ebaVideoControllerSettings');
-        if (saved) settings = Object.assign({}, defaultSettings, JSON.parse(saved));
-    } catch(e) {
-        console.warn('LocalStorage erişim hatası:', e);
+        window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
+        window.addEventListener('focusout', (e) => e.stopImmediatePropagation(), true);
+        document.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
+        window.onblur = null;
+        document.onvisibilitychange = null;
+
+        Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+        Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+        Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+    } catch (e) {
+        console.warn('Blur koruması eklenirken hata:', e);
     }
 
-    // Yardımcı Gecikme (Sleep) Fonksiyonu
+    // ==========================================
+    // 2. VİDEO YÖNETİMİ & ZAMAN SARMA
+    // ==========================================
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // Video Elementini Bulucu (Sayfa ve iframeler içinde arar)
-    const getVideo = () => {
-        let video = document.querySelector('video');
-        if (video) return video;
+    // Video Elementini Bulucu
+    function getVideo() {
+        return document.querySelector('video');
+    }
 
-        // Sayfa içindeki erişilebilir iframe'leri kontrol et
-        const iframes = document.querySelectorAll('iframe');
-        for (let i = 0; i < iframes.length; i++) {
-            try {
-                const frameDoc = iframes[i].contentDocument || iframes[i].contentWindow.document;
-                if (frameDoc) {
-                    const v = frameDoc.querySelector('video');
-                    if (v) return v;
-                }
-            } catch (err) {
-                // Cross-origin iframe olabilir, @allFrames zaten orada çalışacaktır
+    // Video.js veya HTML5 Video Üzerinden Zorla Zamanı Ayarlama
+    function applyTime(video, targetTime) {
+        if (!video) return;
+
+        // 1. Video.js Oynatıcısını Kontrol Et ve Ayarla
+        try {
+            if (window.videojs) {
+                const players = window.videojs.getAllPlayers ? window.videojs.getAllPlayers() : Object.values(window.videojs.players || {});
+                players.forEach(player => {
+                    if (player && typeof player.currentTime === 'function') {
+                        player.currentTime(targetTime);
+                        if (player.paused && typeof player.play === 'function') {
+                            player.play();
+                        }
+                    }
+                });
             }
+        } catch (e) {
+            console.log('VideoJS ayarlama denemesi:', e);
         }
-        return null;
-    };
 
-    // "Ctrl + Alt + ." Tuş Kombinasyonunu Simüle Eden Fonksiyon
+        // 2. HTML5 Video Elementi Prototype ve Standart Setter
+        try {
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+            if (descriptor && descriptor.set) {
+                descriptor.set.call(video, targetTime);
+            } else {
+                video.currentTime = targetTime;
+            }
+        } catch (err) {
+            video.currentTime = targetTime;
+        }
+
+        // 3. Eventleri Tetikle
+        try {
+            video.dispatchEvent(new Event('seeking', { bubbles: true }));
+            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+            video.dispatchEvent(new Event('seeked', { bubbles: true }));
+        } catch (e) {}
+
+        // 4. Oynatmaya zorla
+        if (video.paused) {
+            video.play().catch(() => {});
+        }
+    }
+
+    // "Ctrl + Alt + ." Tuş Kombinasyonu Tetikleyici (Hem frame hem parent/top'a gönderir)
     async function triggerCtrlAltDot() {
-        await sleep(600); // İşlem öncesi doğal bekleme süresi
+        await sleep(500);
 
         const eventOptions = {
             key: '.',
@@ -87,8 +114,13 @@
         };
 
         const targets = [document.activeElement, document.body, document, window];
+        
+        // Üst pencereler varsa onları da dahil et
+        try { if (window.parent && window.parent !== window) targets.push(window.parent.document, window.parent); } catch(e){}
+        try { if (window.top && window.top !== window) targets.push(window.top.document, window.top); } catch(e){}
+
         targets.forEach(target => {
-            if (target) {
+            if (target && target.dispatchEvent) {
                 try {
                     target.dispatchEvent(new KeyboardEvent('keydown', eventOptions));
                     target.dispatchEvent(new KeyboardEvent('keypress', eventOptions));
@@ -98,65 +130,86 @@
         });
     }
 
-    // --- GUI OLUŞTURMA VE YÖNETME ---
+    // ==========================================
+    // 3. GUI VE AYARLAR
+    // ==========================================
+    const defaultSettings = {
+        forwardKey: 'l',
+        backwardKey: 'j',
+        speedUpKey: 'h',
+        speedDownKey: 'g',
+        skipTime: 10,
+        endOffsetSec: 2
+    };
+
+    function getSettings() {
+        try {
+            const saved = localStorage.getItem('obaVideoControllerSettings');
+            if (saved) return Object.assign({}, defaultSettings, JSON.parse(saved));
+        } catch (e) {}
+        return defaultSettings;
+    }
+
+    let settings = getSettings();
+
     function createGUI() {
         if (document.getElementById('vc-gui-container')) return;
         if (!document.body) return;
 
         const guiHTML = `
-            <div id="vc-gui-container" style="position: fixed; top: 30px; right: 30px; width: 310px; background: #181920; color: #f0f0f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 12px; padding: 14px; z-index: 2147483647; box-shadow: 0 10px 30px rgba(0,0,0,0.7); border: 1px solid #333644; font-size: 13px; user-select: none;">
-                <!-- Başlık & Sürükleme Barı -->
-                <div id="vc-header-drag" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2e303e; padding-bottom: 8px; margin-bottom: 12px; cursor: move;">
-                    <h3 style="margin: 0; font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 6px; color: #00cec9; pointer-events: none;">
-                        <span>⚡</span> ÖBA Video Asistanı
+            <div id="vc-gui-container" style="position: fixed; top: 15px; right: 15px; width: 290px; background: rgba(20, 21, 27, 0.95); color: #f0f0f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; border-radius: 10px; padding: 12px; z-index: 2147483647; box-shadow: 0 8px 30px rgba(0,0,0,0.8); border: 1px solid #33374a; font-size: 12px; user-select: none; backdrop-filter: blur(8px);">
+                <!-- Başlık & Sürükleme -->
+                <div id="vc-header-drag" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2d3142; padding-bottom: 6px; margin-bottom: 10px; cursor: move;">
+                    <h3 style="margin: 0; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 5px; color: #00cec9; pointer-events: none;">
+                        <span>⚡</span> ÖBA Video Kontrol
                     </h3>
-                    <button id="vc-toggle-btn" style="background: #252733; border: 1px solid #444; color: #fff; cursor: pointer; font-size: 12px; border-radius: 6px; padding: 2px 8px; transition: 0.2s;">➖</button>
+                    <button id="vc-toggle-btn" style="background: #252836; border: 1px solid #444a60; color: #fff; cursor: pointer; font-size: 11px; border-radius: 4px; padding: 2px 6px;">➖</button>
                 </div>
                 
                 <div id="vc-gui-content">
-                    <!-- Otomatik Sona Sar & Tuşla Bölümü -->
-                    <div style="background: #222430; padding: 10px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #36394a;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <span style="font-weight: 500; font-size: 12px; color: #00d2d3;">Kalan Süre (Bitişe kala):</span>
-                            <span id="vc-offset-val" style="font-weight: 700; color: #00d2d3; font-size: 13px;">${settings.endOffsetSec} sn</span>
+                    <!-- Sona Sar & Tuşla Bölümü -->
+                    <div style="background: #191b24; padding: 8px; border-radius: 6px; margin-bottom: 10px; border: 1px solid #2d3142;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                            <span style="font-weight: 600; font-size: 11px; color: #00d2d3;">Kalan Süre (Bitişe kala):</span>
+                            <span id="vc-offset-val" style="font-weight: 700; color: #00d2d3; font-size: 12px;">${settings.endOffsetSec} sn</span>
                         </div>
-                        <input type="range" id="vc-end-offset" min="1" max="30" step="1" value="${settings.endOffsetSec}" style="width: 100%; accent-color: #00d2d3; cursor: pointer; margin-bottom: 10px;">
+                        <input type="range" id="vc-end-offset" min="1" max="30" step="1" value="${settings.endOffsetSec}" style="width: 100%; accent-color: #00d2d3; cursor: pointer; margin-bottom: 8px;">
                         
-                        <button id="vc-skip-end-btn" style="width: 100%; padding: 9px; background: linear-gradient(135deg, #00b894, #00cec9); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 12px; box-shadow: 0 4px 12px rgba(0,206,201,0.25); transition: 0.2s;">
+                        <button id="vc-skip-end-btn" style="width: 100%; padding: 8px; background: linear-gradient(135deg, #00b894, #00cec9); color: #fff; border: none; border-radius: 5px; cursor: pointer; font-weight: 700; font-size: 11px; box-shadow: 0 3px 10px rgba(0,206,201,0.3); transition: 0.2s;">
                             ⏩ Sona Sar & Bitince Tuşla (Ctrl+Alt+.)
                         </button>
                     </div>
 
-                    <!-- Tuş Kısayolları Ayarları -->
-                    <div style="font-size: 11px; color: #7f8fa6; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">Klavye Kısayolları</div>
+                    <!-- Kısayollar -->
+                    <div style="font-size: 10px; color: #8892b0; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">Klavye Kısayolları</div>
                     
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px;">
                         <div>
-                            <label style="font-size: 11px; display: block; margin-bottom: 3px; color: #a4b0be;">İleri Sar</label>
-                            <input type="text" id="vc-fwd-key" value="${settings.forwardKey}" maxlength="1" style="width: 100%; padding: 5px; box-sizing: border-box; background: #222430; color: #fff; border: 1px solid #3c4052; text-align: center; border-radius: 4px; outline: none;">
+                            <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">İleri Sar</label>
+                            <input type="text" id="vc-fwd-key" value="${settings.forwardKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div>
-                            <label style="font-size: 11px; display: block; margin-bottom: 3px; color: #a4b0be;">Geri Sar</label>
-                            <input type="text" id="vc-bwd-key" value="${settings.backwardKey}" maxlength="1" style="width: 100%; padding: 5px; box-sizing: border-box; background: #222430; color: #fff; border: 1px solid #3c4052; text-align: center; border-radius: 4px; outline: none;">
+                            <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Geri Sar</label>
+                            <input type="text" id="vc-bwd-key" value="${settings.backwardKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div>
-                            <label style="font-size: 11px; display: block; margin-bottom: 3px; color: #a4b0be;">Hızlandır</label>
-                            <input type="text" id="vc-sup-key" value="${settings.speedUpKey}" maxlength="1" style="width: 100%; padding: 5px; box-sizing: border-box; background: #222430; color: #fff; border: 1px solid #3c4052; text-align: center; border-radius: 4px; outline: none;">
+                            <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Hızlandır</label>
+                            <input type="text" id="vc-sup-key" value="${settings.speedUpKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div>
-                            <label style="font-size: 11px; display: block; margin-bottom: 3px; color: #a4b0be;">Yavaşlat</label>
-                            <input type="text" id="vc-sdwn-key" value="${settings.speedDownKey}" maxlength="1" style="width: 100%; padding: 5px; box-sizing: border-box; background: #222430; color: #fff; border: 1px solid #3c4052; text-align: center; border-radius: 4px; outline: none;">
+                            <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Yavaşlat</label>
+                            <input type="text" id="vc-sdwn-key" value="${settings.speedDownKey}" maxlength="1" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; text-align: center; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                         <div style="grid-column: span 2;">
-                            <label style="font-size: 11px; display: block; margin-bottom: 3px; color: #a4b0be;">Atlama Miktarı (Saniye)</label>
-                            <input type="number" id="vc-skip-time" value="${settings.skipTime}" style="width: 100%; padding: 5px; box-sizing: border-box; background: #222430; color: #fff; border: 1px solid #3c4052; border-radius: 4px; outline: none;">
+                            <label style="font-size: 10px; display: block; margin-bottom: 2px; color: #a4b0be;">Atlama Miktarı (Saniye)</label>
+                            <input type="number" id="vc-skip-time" value="${settings.skipTime}" style="width: 100%; padding: 4px; box-sizing: border-box; background: #191b24; color: #fff; border: 1px solid #33374a; border-radius: 4px; outline: none; font-size: 11px;">
                         </div>
                     </div>
                     
-                    <button id="vc-save-btn" style="width: 100%; padding: 8px; background: #353b48; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 12px; transition: 0.2s;">
+                    <button id="vc-save-btn" style="width: 100%; padding: 6px; background: #2f3542; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px; transition: 0.2s;">
                         💾 Ayarları Kaydet
                     </button>
-                    <div id="vc-status" style="font-size: 11px; color: #00cec9; text-align: center; margin-top: 8px; display: none; line-height: 1.4; padding: 4px; border-radius: 4px;"></div>
+                    <div id="vc-status" style="font-size: 10px; color: #00cec9; text-align: center; margin-top: 6px; display: none; line-height: 1.3; padding: 3px; border-radius: 4px;"></div>
                 </div>
             </div>
         `;
@@ -166,7 +219,6 @@
         guiWrapper.innerHTML = guiHTML;
         document.body.appendChild(guiWrapper);
 
-        // --- GUI ELEMENTLERİ & ETKİLEŞİM ---
         const container = document.getElementById('vc-gui-container');
         const content = document.getElementById('vc-gui-content');
         const toggleBtn = document.getElementById('vc-toggle-btn');
@@ -177,28 +229,28 @@
         const statusText = document.getElementById('vc-status');
         const headerDrag = document.getElementById('vc-header-drag');
 
-        const showStatus = (msg, duration = 2500, color = '#00cec9', bg = 'rgba(0, 206, 201, 0.1)') => {
+        const showStatus = (msg, duration = 2500, color = '#00cec9') => {
+            if (!statusText) return;
             statusText.textContent = msg;
             statusText.style.color = color;
-            statusText.style.background = bg;
+            statusText.style.background = 'rgba(0, 206, 201, 0.1)';
             statusText.style.display = 'block';
             if (duration > 0) {
                 setTimeout(() => {
-                    statusText.style.display = 'none';
+                    if (statusText) statusText.style.display = 'none';
                 }, duration);
             }
         };
 
-        // Slider Değeri Değişimi
+        // Slider Değişimi
         endOffsetSlider.addEventListener('input', (e) => {
             endOffsetVal.textContent = `${e.target.value} sn`;
             settings.endOffsetSec = parseInt(e.target.value, 10);
         });
 
-        // Tuş yazarken video kısayollarını engelle
         container.addEventListener('keydown', (e) => e.stopPropagation());
 
-        // Sürükle Bırak (Draggable) Özelliği
+        // Sürükle Bırak
         let isDragging = false, startX, startY, initialLeft, initialTop;
         headerDrag.addEventListener('mousedown', (e) => {
             if (e.target === toggleBtn) return;
@@ -225,7 +277,7 @@
             isDragging = false;
         });
 
-        // Paneli Küçült / Büyüt
+        // Küçült / Büyüt
         toggleBtn.addEventListener('click', () => {
             if (content.style.display === 'none') {
                 content.style.display = 'block';
@@ -247,66 +299,66 @@
 
             try {
                 localStorage.setItem('obaVideoControllerSettings', JSON.stringify(settings));
-            } catch(e) {}
-            showStatus('✅ Ayarlar Kaydedildi!', 2000, '#00b894', 'rgba(0, 184, 148, 0.15)');
+            } catch (e) {}
+            showStatus('✅ Ayarlar Kaydedildi!', 2000, '#00b894');
         });
 
-        // --- SONA SAR VE BİTİNCE TETİKLE MANTIĞI ---
+        // Sona Sar ve Bitişte Tetikle
         skipEndBtn.addEventListener('click', async () => {
             const video = getVideo();
             if (!video) {
-                showStatus('⚠️ Sayfada video bulunamadı!', 3000, '#ff7675', 'rgba(255, 118, 117, 0.15)');
+                showStatus('⚠️ Bu alanda video bulunamadı!', 3000, '#ff7675');
                 return;
             }
 
-            if (isNaN(video.duration) || video.duration <= 0) {
-                showStatus('⚠️ Video henüz başlatılmadı veya süresi alınamadı!', 3000, '#ff7675', 'rgba(255, 118, 117, 0.15)');
+            const duration = video.duration;
+            if (!duration || isNaN(duration) || duration <= 0) {
+                showStatus('⚠️ Video süresi yüklenmedi, önce videoyu başlatın!', 3000, '#ff7675');
                 return;
             }
 
             const offset = parseInt(endOffsetSlider.value, 10) || 2;
-            const targetTime = Math.max(0, video.duration - offset);
-            
-            video.currentTime = targetTime;
-            
-            // Eğer duraklatılmışsa otomatik oynat
-            if (video.paused) {
-                try {
-                    await video.play();
-                } catch (err) {
-                    console.log('Video otomatik oynatılamadı, lütfen oynata basın:', err);
-                }
-            }
+            const targetTime = Math.max(0, duration - offset);
 
-            showStatus(`⏳ Son ${offset} sn'ye sarıldı, video bitişi bekleniyor...`, 0, '#ffeaa7', 'rgba(255, 234, 167, 0.15)');
+            // Zamanı zorla ayarla
+            applyTime(video, targetTime);
+
+            // Birkaç kez tekrarla (Sitenin sıfırlamasını engellemek için)
+            let retryCount = 0;
+            const retryInterval = setInterval(() => {
+                if (retryCount++ < 5 && video.currentTime < targetTime - 1) {
+                    applyTime(video, targetTime);
+                } else {
+                    clearInterval(retryInterval);
+                }
+            }, 100);
+
+            showStatus(`⏳ Son ${offset} sn'ye sarıldı, bitiş bekleniyor...`, 0, '#ffeaa7');
 
             let handled = false;
             const completeAction = async () => {
                 if (handled) return;
                 handled = true;
 
-                // Event listener'ları temizle
                 video.removeEventListener('ended', completeAction);
                 video.removeEventListener('pause', onPauseCheck);
                 video.removeEventListener('timeupdate', onTimeUpdateCheck);
 
-                showStatus('⏳ Video tamamlandı, bekleniyor...', 0, '#74b9ff', 'rgba(116, 185, 255, 0.15)');
-                await sleep(800); // Doğal gecikme
+                showStatus('⏳ Video tamamlandı, bekleniyor...', 0, '#74b9ff');
+                await sleep(800);
 
-                // "Ctrl + Alt + ." tuş kombinasyonunu bas
                 await triggerCtrlAltDot();
-
-                showStatus('✅ "Ctrl + Alt + ." başarıyla tetiklendi!', 4000, '#55efc4', 'rgba(85, 239, 196, 0.15)');
+                showStatus('✅ "Ctrl + Alt + ." tuşlandı!', 4000, '#55efc4');
             };
 
             const onPauseCheck = () => {
-                if (video.currentTime >= video.duration - 0.5 || video.ended) {
+                if (video.currentTime >= video.duration - 0.6 || video.ended) {
                     completeAction();
                 }
             };
 
             const onTimeUpdateCheck = () => {
-                if (video.currentTime >= video.duration - 0.2 || video.ended) {
+                if (video.currentTime >= video.duration - 0.3 || video.ended) {
                     completeAction();
                 }
             };
@@ -317,27 +369,8 @@
         });
     }
 
-    // --- SAYFA VE SPA YÜKLEME KONTROLLERİ ---
-    // DOM hazır olduğunda veya SPA sayfa geçişlerinde GUI'yi koru
-    const initInterval = setInterval(() => {
-        if (document.body) {
-            createGUI();
-            // Eğer GUI oluşturulduysa interval'i yavaşlat/kontrol et
-            if (document.getElementById('vc-gui-container')) {
-                // SPA kontrolleri için periyodik hafif kontrol
-            }
-        }
-    }, 500);
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', createGUI);
-    } else {
-        createGUI();
-    }
-
-    // --- KLAVYE KONTROL DİNLEYİCİSİ ---
+    // --- KLAVYE DİNLEYİCİSİ ---
     document.addEventListener('keydown', function(e) {
-        // Form öğelerindeyken kısayolları çalıştırma
         const activeTag = e.target.tagName ? e.target.tagName.toLowerCase() : '';
         if (activeTag === 'input' || activeTag === 'textarea' || e.target.isContentEditable) return;
 
@@ -349,17 +382,30 @@
 
         switch(key) {
             case settings.forwardKey:
-                video.currentTime += skipSecs;
+                applyTime(video, video.currentTime + skipSecs);
                 break;
             case settings.backwardKey:
-                video.currentTime -= skipSecs;
+                applyTime(video, Math.max(0, video.currentTime - skipSecs));
                 break;
             case settings.speedUpKey:
-                video.playbackRate += 0.25;
+                video.playbackRate = Math.min(16, video.playbackRate + 0.25);
                 break;
             case settings.speedDownKey:
                 video.playbackRate = Math.max(0.25, video.playbackRate - 0.25);
                 break;
         }
-    }, true); // Capture mode ile site engellemelerini aş
+    }, true);
+
+    // --- BAŞLATICI ---
+    const initInterval = setInterval(() => {
+        if (document.body) {
+            createGUI();
+        }
+    }, 500);
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', createGUI);
+    } else {
+        createGUI();
+    }
 })();
